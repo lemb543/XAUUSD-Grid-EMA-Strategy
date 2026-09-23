@@ -1,28 +1,28 @@
 //+------------------------------------------------------------------+
 //| XAUUSDm_EMA_Grid_Bot.mq5                                         |
-//| Corrected strategy for XAUUSDm                                    |
 //|                                                                  |
-//| Cycle structure:                                                 |
-//| 1. At cycle start open BUY + SELL simultaneously (0.01 each).     |
-//| 2. Then on each new 1-point grid, if price > EMA10 open BUY only |
-//|    and if price < EMA10 open SELL only.                           |
-//| 3. When total EA profit >= $5, close all positions and start a    |
-//|    new cycle.                                                    |
-//| 4. Pair: XAUUSDm, M1, EMA10                                      |
-//| 5. Requires hedging MT5 account.                                 |
+//| Rules:                                                           |
+//| 1. Start each cycle with one BUY and one SELL.                   |
+//| 2. Use EMA period 1 on M1 for grid direction.                    |
+//| 3. At a new grid level, wait for the next tick confirmation.     |
+//| 4. After confirmation, open one BUY above EMA1 or one SELL below  |
+//|    EMA1.                                                         |
+//| 5. Maximum open positions per cycle = 10.                        |
+//| 6. If ANY EA position closes, close all remaining EA positions.  |
+//| 7. After all positions are closed, reset and start a new cycle.  |
+//| 8. Requires an MT5 hedging account.                              |
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.04"
+#property version "1.06"
 
 #include <Trade/Trade.mqh>
 
-input double InpLotSize          = 0.01;       // lot size per order
-input int    InpGridPoints       = 1;          // grid spacing in points
-input int    InpEMAPeriod        = 10;         // EMA period
-input double InpProfitTargetUSD  = 5.00;       // total profit target in USD
-input ulong  InpMagicNumber      = 20260917;   // unique magic number
-input int    InpDeviationPoints  = 20;         // max slippage in points
-input int    InpMaxOrders        = 100;        // maximum orders safety cap
+input double InpLotSize          = 0.01;       // Lot size per order
+input int    InpGridPoints       = 1;          // Grid spacing in points
+input int    InpEMAPeriod        = 1;          // EMA period
+input ulong  InpMagicNumber      = 20260917;   // Unique magic number
+input int    InpDeviationPoints  = 20;         // Maximum slippage
+input int    InpMaxPositions     = 10;         // Maximum positions per cycle
 
 const string TRADE_SYMBOL = "XAUUSDm";
 const ENUM_TIMEFRAMES TRADE_TIMEFRAME = PERIOD_M1;
@@ -31,7 +31,10 @@ CTrade g_trade;
 int    g_emaHandle = INVALID_HANDLE;
 double g_gridStep = 0.0;
 double g_lastGridLevel = 0.0;
+double g_pendingGridLevel = 0.0;
+int    g_pendingDirection = 0;                 // 1 = BUY, -1 = SELL
 bool   g_cycleStarted = false;
+bool   g_closingBasket = false;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                             |
@@ -50,8 +53,7 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   long tradeMode = SymbolInfoInteger(TRADE_SYMBOL, SYMBOL_TRADE_MODE);
-   if(tradeMode == SYMBOL_TRADE_MODE_DISABLED)
+   if(SymbolInfoInteger(TRADE_SYMBOL, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
    {
       Alert("Trading is disabled for XAUUSDm.");
       return INIT_FAILED;
@@ -62,7 +64,13 @@ int OnInit()
 
    if(marginMode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
    {
-      Alert("This strategy requires a hedging MT5 account. Netting accounts cannot hold BUY and SELL simultaneously.");
+      Alert("This strategy requires a hedging MT5 account.");
+      return INIT_FAILED;
+   }
+
+   if(InpLotSize <= 0.0 || InpGridPoints <= 0 || InpEMAPeriod <= 0 || InpMaxPositions < 2)
+   {
+      Alert("Invalid input values.");
       return INIT_FAILED;
    }
 
@@ -86,7 +94,7 @@ int OnInit()
 
    if(g_emaHandle == INVALID_HANDLE)
    {
-      Alert("Could not create EMA10 indicator for XAUUSDm M1.");
+      Alert("Could not create EMA indicator.");
       return INIT_FAILED;
    }
 
@@ -94,15 +102,23 @@ int OnInit()
    g_trade.SetDeviationInPoints(InpDeviationPoints);
    g_trade.SetTypeFillingBySymbol(TRADE_SYMBOL);
 
+   int count = GetOwnPositionCount();
+   if(count > 0)
+   {
+      g_cycleStarted = true;
+
+      MqlTick tick;
+      if(SymbolInfoTick(TRADE_SYMBOL, tick))
+         g_lastGridLevel = GridLevel((tick.bid + tick.ask) / 2.0);
+   }
+
    Print("==============================================");
    Print("XAUUSDm EMA Grid Bot initialized");
-   Print("Symbol: ", TRADE_SYMBOL);
-   Print("Timeframe: M1");
    Print("EMA period: ", InpEMAPeriod);
    Print("Grid spacing: ", InpGridPoints, " point(s)");
-   Print("Grid distance: ", DoubleToString(g_gridStep, 5));
-   Print("Lot per order: ", DoubleToString(InpLotSize, 2));
-   Print("Target: $", DoubleToString(InpProfitTargetUSD, 2));
+   Print("Maximum positions per cycle: ", InpMaxPositions);
+   Print("Confirmation: next tick after a new grid level");
+   Print("Any closed position closes all remaining positions");
    Print("==============================================");
 
    return INIT_SUCCEEDED;
@@ -122,7 +138,7 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(Symbol() != TRADE_SYMBOL)
+   if(Symbol() != TRADE_SYMBOL || g_closingBasket)
       return;
 
    MqlTick tick;
@@ -132,6 +148,19 @@ void OnTick()
    if(tick.bid <= 0.0 || tick.ask <= 0.0)
       return;
 
+   int positionCount = GetOwnPositionCount();
+
+   if(positionCount == 0)
+   {
+      g_cycleStarted = false;
+      g_lastGridLevel = 0.0;
+      g_pendingGridLevel = 0.0;
+      g_pendingDirection = 0;
+   }
+
+   if(positionCount >= InpMaxPositions)
+      return;
+
    double ema = GetEMA();
    if(ema <= 0.0)
       return;
@@ -139,52 +168,116 @@ void OnTick()
    double currentPrice = (tick.bid + tick.ask) / 2.0;
    double currentGrid = GridLevel(currentPrice);
 
-   double totalProfit = GetOwnProfit();
-
-   // Close all when target reached.
-   if(totalProfit >= InpProfitTargetUSD)
-   {
-      if(CloseAllPositions())
-      {
-         g_cycleStarted = false;
-         g_lastGridLevel = 0.0;
-         Print("Target hit. All positions closed. New cycle will start next tick.");
-      }
-      return;
-   }
-
-   // If cycle not started, open BUY and SELL simultaneously.
+   // Start each cycle with BUY + SELL.
    if(!g_cycleStarted)
    {
       if(OpenInitialHedgePair())
       {
          g_cycleStarted = true;
          g_lastGridLevel = currentGrid;
+         g_pendingGridLevel = 0.0;
+         g_pendingDirection = 0;
       }
       return;
    }
 
-   // If new grid level is reached, open only one directional order.
+   if(GetOwnPositionCount() >= InpMaxPositions)
+      return;
+
+   // First tick at a new grid: remember the direction and wait.
    if(!SamePrice(currentGrid, g_lastGridLevel))
    {
+      int direction = 0;
+
       if(currentPrice > ema)
-      {
-         if(OpenBuyOnly())
-            g_lastGridLevel = currentGrid;
-      }
+         direction = 1;
       else if(currentPrice < ema)
+         direction = -1;
+
+      if(direction != 0)
       {
-         if(OpenSellOnly())
-            g_lastGridLevel = currentGrid;
+         g_pendingGridLevel = currentGrid;
+         g_pendingDirection = direction;
+      }
+
+      return;
+   }
+
+   // Next tick confirmation must still be at the same new grid level.
+   if(g_pendingDirection != 0 && SamePrice(currentGrid, g_pendingGridLevel))
+   {
+      bool opened = false;
+
+      if(g_pendingDirection == 1 && currentPrice > ema)
+         opened = OpenBuyOnly();
+      else if(g_pendingDirection == -1 && currentPrice < ema)
+         opened = OpenSellOnly();
+
+      if(opened)
+      {
+         g_lastGridLevel = currentGrid;
+         g_pendingGridLevel = 0.0;
+         g_pendingDirection = 0;
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Start cycle: open BUY + SELL simultaneously                        |
+//| Any position closure closes the entire EA basket                  |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(
+   const MqlTradeTransaction &transaction,
+   const MqlTradeRequest &request,
+   const MqlTradeResult &result
+)
+{
+   if(transaction.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+
+   ulong dealTicket = transaction.deal;
+   if(dealTicket == 0 || !HistoryDealSelect(dealTicket))
+      return;
+
+   string symbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+   ulong magic = (ulong)HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+   ENUM_DEAL_ENTRY entry =
+      (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+
+   if(symbol != TRADE_SYMBOL || magic != InpMagicNumber)
+      return;
+
+   // Ignore opening deals; react only when a position is closed.
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+      return;
+
+   if(g_closingBasket)
+      return;
+
+   Print("One EA position closed. Closing all remaining EA positions.");
+
+   g_closingBasket = true;
+   CloseAllPositions();
+
+   if(GetOwnPositionCount() == 0)
+   {
+      g_cycleStarted = false;
+      g_lastGridLevel = 0.0;
+      g_pendingGridLevel = 0.0;
+      g_pendingDirection = 0;
+      Print("All positions closed. Cycle reset.");
+   }
+
+   g_closingBasket = false;
+}
+
+//+------------------------------------------------------------------+
+//| Open initial BUY + SELL pair                                      |
 //+------------------------------------------------------------------+
 bool OpenInitialHedgePair()
 {
+   if(GetOwnPositionCount() != 0)
+      return false;
+
    bool buyOK = g_trade.Buy(
       InpLotSize,
       TRADE_SYMBOL,
@@ -195,6 +288,12 @@ bool OpenInitialHedgePair()
    );
 
    ulong buyTicket = g_trade.ResultOrder();
+
+   if(!buyOK)
+   {
+      Print("Initial BUY failed: ", g_trade.ResultRetcodeDescription());
+      return false;
+   }
 
    bool sellOK = g_trade.Sell(
       InpLotSize,
@@ -207,31 +306,24 @@ bool OpenInitialHedgePair()
 
    ulong sellTicket = g_trade.ResultOrder();
 
-   if(!buyOK || !sellOK)
+   if(!sellOK)
    {
-      Print("Initial hedge pair failed. BUY=", buyOK, " SELL=", sellOK,
-            " retcode=", g_trade.ResultRetcode(),
-            " comment=", g_trade.ResultRetcodeDescription());
-
-      if(buyOK && buyTicket > 0)
-         ClosePositionByTicket(buyTicket);
-
-      if(sellOK && sellTicket > 0)
-         ClosePositionByTicket(sellTicket);
-
+      Print("Initial SELL failed: ", g_trade.ResultRetcodeDescription());
+      ClosePositionByTicket(buyTicket);
       return false;
    }
 
-   Print("Initial hedge pair opened: BUY + SELL 0.01 lot each.");
+   Print("Initial BUY + SELL opened. Buy ticket=", buyTicket,
+         ", Sell ticket=", sellTicket);
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Open only BUY at the new grid level                               |
+//| Open BUY at a confirmed new grid level                            |
 //+------------------------------------------------------------------+
 bool OpenBuyOnly()
 {
-   if(GetOwnOrderCount() >= InpMaxOrders)
+   if(GetOwnPositionCount() >= InpMaxPositions)
       return false;
 
    bool ok = g_trade.Buy(
@@ -240,23 +332,23 @@ bool OpenBuyOnly()
       0.0,
       0.0,
       0.0,
-      "GRID_BUY"
+      "GRID_BUY_EMA1"
    );
 
    if(ok)
-      Print("BUY order opened at grid ", DoubleToString(g_lastGridLevel, 5));
+      Print("Confirmed EMA1 grid BUY opened.");
    else
-      Print("BUY order failed: ", g_trade.ResultRetcodeDescription());
+      Print("Grid BUY failed: ", g_trade.ResultRetcodeDescription());
 
    return ok;
 }
 
 //+------------------------------------------------------------------+
-//| Open only SELL at the new grid level                              |
+//| Open SELL at a confirmed new grid level                           |
 //+------------------------------------------------------------------+
 bool OpenSellOnly()
 {
-   if(GetOwnOrderCount() >= InpMaxOrders)
+   if(GetOwnPositionCount() >= InpMaxPositions)
       return false;
 
    bool ok = g_trade.Sell(
@@ -265,13 +357,13 @@ bool OpenSellOnly()
       0.0,
       0.0,
       0.0,
-      "GRID_SELL"
+      "GRID_SELL_EMA1"
    );
 
    if(ok)
-      Print("SELL order opened at grid ", DoubleToString(g_lastGridLevel, 5));
+      Print("Confirmed EMA1 grid SELL opened.");
    else
-      Print("SELL order failed: ", g_trade.ResultRetcodeDescription());
+      Print("Grid SELL failed: ", g_trade.ResultRetcodeDescription());
 
    return ok;
 }
@@ -279,23 +371,17 @@ bool OpenSellOnly()
 //+------------------------------------------------------------------+
 //| Count all positions owned by this EA                              |
 //+------------------------------------------------------------------+
-int GetOwnOrderCount()
+int GetOwnPositionCount()
 {
    int count = 0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-      if(ticket == 0)
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
          continue;
 
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      ulong magic = (ulong)PositionGetInteger(POSITION_MAGIC);
-
-      if(symbol == TRADE_SYMBOL && magic == InpMagicNumber)
+      if(IsOwnPosition())
          count++;
    }
 
@@ -303,36 +389,7 @@ int GetOwnOrderCount()
 }
 
 //+------------------------------------------------------------------+
-//| Calculate total profit for this EA's positions                    |
-//+------------------------------------------------------------------+
-double GetOwnProfit()
-{
-   double profit = 0.0;
-
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0)
-         continue;
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      ulong magic = (ulong)PositionGetInteger(POSITION_MAGIC);
-
-      if(symbol != TRADE_SYMBOL || magic != InpMagicNumber)
-         continue;
-
-      profit += PositionGetDouble(POSITION_PROFIT);
-      profit += PositionGetDouble(POSITION_SWAP);
-   }
-
-   return profit;
-}
-
-//+------------------------------------------------------------------+
-//| Close all positions for this EA                                   |
+//| Close every remaining position owned by this EA                   |
 //+------------------------------------------------------------------+
 bool CloseAllPositions()
 {
@@ -341,45 +398,45 @@ bool CloseAllPositions()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-      if(ticket == 0)
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
          continue;
 
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      ulong magic = (ulong)PositionGetInteger(POSITION_MAGIC);
-
-      if(symbol != TRADE_SYMBOL || magic != InpMagicNumber)
+      if(!IsOwnPosition())
          continue;
 
       if(!ClosePositionByTicket(ticket))
          allOk = false;
    }
 
-   return allOk && (GetOwnOrderCount() == 0);
+   if(GetOwnPositionCount() > 0)
+      allOk = false;
+
+   return allOk;
 }
 
 //+------------------------------------------------------------------+
-//| Close single position                                            |
+//| Close one position                                               |
 //+------------------------------------------------------------------+
 bool ClosePositionByTicket(const ulong ticket)
 {
    bool accepted = g_trade.PositionClose(ticket);
+
    if(!accepted)
    {
       Print("Close failed for ticket ", ticket,
-            " retcode=", g_trade.ResultRetcode(),
-            " desc=", g_trade.ResultRetcodeDescription());
+            ". Retcode=", g_trade.ResultRetcode(),
+            ". Description=", g_trade.ResultRetcodeDescription());
       return false;
    }
 
    uint retcode = g_trade.ResultRetcode();
-   if(retcode != TRADE_RETCODE_DONE && retcode != TRADE_RETCODE_DONE_PARTIAL)
+
+   if(retcode != TRADE_RETCODE_DONE &&
+      retcode != TRADE_RETCODE_DONE_PARTIAL)
    {
       Print("Close rejected for ticket ", ticket,
-            " retcode=", retcode,
-            " desc=", g_trade.ResultRetcodeDescription());
+            ". Retcode=", retcode,
+            ". Description=", g_trade.ResultRetcodeDescription());
       return false;
    }
 
@@ -387,7 +444,18 @@ bool ClosePositionByTicket(const ulong ticket)
 }
 
 //+------------------------------------------------------------------+
-//| Get EMA10 value                                                   |
+//| Check whether the selected position belongs to this EA            |
+//+------------------------------------------------------------------+
+bool IsOwnPosition()
+{
+   string symbol = PositionGetString(POSITION_SYMBOL);
+   ulong magic = (ulong)PositionGetInteger(POSITION_MAGIC);
+
+   return symbol == TRADE_SYMBOL && magic == InpMagicNumber;
+}
+
+//+------------------------------------------------------------------+
+//| Get EMA value                                                     |
 //+------------------------------------------------------------------+
 double GetEMA()
 {
@@ -401,7 +469,7 @@ double GetEMA()
 }
 
 //+------------------------------------------------------------------+
-//| Convert price to grid level using 1-point spacing                 |
+//| Convert price to grid level                                      |
 //+------------------------------------------------------------------+
 double GridLevel(const double price)
 {
@@ -410,12 +478,12 @@ double GridLevel(const double price)
 }
 
 //+------------------------------------------------------------------+
-//| Compare two grid levels                                          |
+//| Compare grid levels                                               |
 //+------------------------------------------------------------------+
 bool SamePrice(const double first, const double second)
 {
    double point = SymbolInfoDouble(TRADE_SYMBOL, SYMBOL_POINT);
-   return MathAbs(first - second) <= (point / 2.0);
+   return MathAbs(first - second) <= point / 2.0;
 }
 
 //+------------------------------------------------------------------+
